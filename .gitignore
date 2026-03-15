@@ -1,4 +1,3 @@
-/backend/app/ml_models
-.env
-.env.*
-!.env.example
+.DS_Store
+.idea/
+backend/app/batch_outputs/
