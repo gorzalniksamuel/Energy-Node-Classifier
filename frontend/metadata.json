@@ -1,0 +1,5 @@
+{
+  "name": "GeoSpatial Analyst",
+  "description": "A comprehensive frontend for geospatial analysis, supporting single and batch predictions using various research methods.",
+  "requestFramePermissions": []
+}

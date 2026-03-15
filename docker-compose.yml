@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: postgres_db
+    restart: always
+    environment:
+      - POSTGRES_USER=adminuser
+      - POSTGRES_PASSWORD=ultrasafepassword
+      - POSTGRES_DB=energygridclassifier
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: backend
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./backend/app:/app
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://adminuser:ultrasafepassword@db:5432/energygridclassifier
+
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+
+networks:
+  default:
+    name: hydrogen_gas_net
+
+volumes:
+  postgres_data:
