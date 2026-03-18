@@ -320,7 +320,7 @@ class MultiModalFusionEngine:
             weights: Dict[str, float],
             active_modalities: Dict[str, bool],
             use_distance_weighting: bool = True,
-            lambda_m: float = 1500.0,
+            lambda_m: float = 1500,
     ) -> Dict[str, Any]:
 
         modal_scores = {
@@ -521,7 +521,7 @@ class MultiModalFusionEngine:
             if not non_hydrogen:
                 continue
 
-            share = (weights["database"] * 0.9) / len(non_hydrogen)
+            share = (weights["database"] * 1) / len(non_hydrogen)
             for m in non_hydrogen:
                 scores[m] += share
                 modal_scores["database"][m] += share
