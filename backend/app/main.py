@@ -5,35 +5,34 @@ import time
 import random
 import base64
 import threading
-from re import search
-
 import requests
-from requests.exceptions import Timeout, ConnectionError, HTTPError
+import pandas as pd
+import time, traceback
 
-import matplotlib
-matplotlib.use("Agg")
+from pydantic import BaseModel, Field
+from typing import Optional, Any, List, Dict
+
+from re import search
+from requests.exceptions import Timeout, ConnectionError, HTTPError
 
 import folium
 from folium.plugins import MarkerCluster
 
-
-
 import html as _html
-
 from collections import Counter
 
 
-
+from fastapi import Depends
+from fastapi import BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 
 import concurrent.futures
-
-from typing import Optional, Any, List, Dict
-
-from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 from PIL import Image, ImageDraw
+from batch_manager import BatchManager
 
 from google import genai
 from google.genai import types
@@ -42,26 +41,27 @@ from io import BytesIO
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
+import matplotlib
+matplotlib.use("Agg")
+
 from heat_radiation import run_heat_radiation
 from ml_engine import EnergyClassifier, ObjectDetector
 from fusion_engine import MultiModalFusionEngine
 from pipeline_wrapper import run_single_pipeline
+from models import KeyValidationRequest, OsmFeature, PredictionRequest, PredictionResponse, BatchRequest
 
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load default models on startup
     print("Pre-loading models...")
-    classifier.load_model("effnet")
-    detector.load_model("yolo11")
+    classifier.load_model("convnext_large")
+    detector.load_model("yolo26")
     yield
     # Clean up if needed
     print("Shutting down")
 
-from fastapi import BackgroundTasks, UploadFile, File
-from batch_manager import BatchManager
-import pandas as pd
+
 
 batch_manager = BatchManager()
 
@@ -76,108 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Models (TODO: move to models.py / import)
-class KeyValidationRequest(BaseModel):
-    service: str
-    key: str
-
-class PredictionRequest(BaseModel):
-    latitude: float
-    longitude: float
-    buffer: float
-
-    aws_api_key: Optional[str] = ""
-    mapbox_api_key: Optional[str] = ""
-    gemini_api_key: Optional[str] = ""
-    google_maps_api_key: Optional[str] = ""
-    sentinel_api_key: Optional[str] = ""
-
-    # Feature Flags
-    run_osm: bool = False
-    run_database: bool = False
-    run_classification: bool = False
-    run_object_detection: bool = False
-    run_agent: bool = False
-
-    run_heat_radiation: bool = False
-
-    # Model Selection
-    classification_model: str = "convnext_large"
-    detection_model: str = "yolo11"
-
-    # Heat emissions parameters
-    heat_start_date: str = "2024-06-01"
-    heat_end_date: str = "2024-09-30"
-    heat_max_cloud: float = 75.0
-    heat_max_scenes: int = 20
-    heat_aoi_m: float = 1000
-    heat_ring_inner_m: float = 2000
-    heat_ring_outer_m: float = 4500
-    heat_hotspot_offset_c: float = 1.0
-
-    fusion_weights: Optional[Dict[str, float]] = None
-
-class OsmFeature(BaseModel):
-    lat: float
-    lon: float
-    category: str
-    name: str
-    tags: Dict[str, Any]
-
-class PredictionResponse(BaseModel):
-    summary: str
-    osm_html: Optional[str] = None
-    osm_class_counts: Optional[Dict[str, int]] = None
-
-    osm_features: Optional[List[OsmFeature]] = None
-
-    database_records: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
-    classification_results: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
-    detection_results: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
-
-    satellite_image: Optional[str] = None
-    heatmap_image: Optional[str] = None
-    heatmap_images: Optional[Dict[str, str]] = None
-    detection_image: Optional[str] = None
-
-    agent_report: Optional[str] = None
-    final_prediction: Optional[str] = None
-
-    agent_confidence: Optional[float] = None
-    agent_review_summary: Optional[str] = None
-    agent_rationale: Optional[str] = None
-    agent_key_evidence: Optional[List[str]] = None
-    agent_reviewed_inputs: Optional[List[str]] = None
-
-    heat_radiation_image: Optional[str] = None
-    heat_radiation_result: Optional[Dict[str, Any]] = None
-
-    fusion_result: Optional[Dict[str, Any]] = None
-
-    prediction: Any = None
-
-class BatchRequest(BaseModel):
-    aws_api_key: Optional[str] = ""
-    mapbox_api_key: Optional[str] = ""
-    gemini_api_key: Optional[str] = ""
-    sentinel_api_key: Optional[str] = ""
-
-    run_osm: bool = False
-    run_database: bool = False
-    run_classification: bool = False
-    run_object_detection: bool = False
-    run_agent: bool = False
-    run_heat_radiation: bool = False
-
-    classification_model: str = "convnext_large"
-    detection_model: str = "yolo11"
-
-    fusion_weights: Optional[Dict[str, float]] = None
-
-
-
-
 
 
 
@@ -1109,8 +1007,6 @@ def fetch_mapbox_image(lat, lon, buffer_km, api_key):
     else:
         raise Exception(f"Mapbox Error {response.status_code}: {response.text[:200]}")
 
-import time, traceback
-
 
 def run_classification_task_from_image(raw_image: Image.Image, model_key: str):
     t0 = time.time()
@@ -1603,7 +1499,8 @@ def predict(request: PredictionRequest):
                 "osm": request.run_osm,
                 "database": request.run_database,
                 "agent": request.run_agent
-            }
+            },
+            lambda_m=request.buffer * 1000.0
         )
 
         summary_parts.append(f"Fusion: {fusion_result['classes']}")
@@ -1643,13 +1540,7 @@ def predict(request: PredictionRequest):
         fusion_result=fusion_result,
     )
 
-from fastapi import Depends
 
-from fastapi import Form
-
-from fastapi import BackgroundTasks, UploadFile, File, Form
-import json
-import pandas as pd
 
 
 @app.post("/batch")
@@ -1672,7 +1563,7 @@ async def run_batch(
         run_heat_radiation: bool = Form(False),
 
         classification_model: str = Form("convnext_large"),
-        detection_model: str = Form("yolo11"),
+        detection_model: str = Form("yolo26"),
 
         # fusion weights (json string)
         fusion_weights: str = Form("{}"),
@@ -1782,8 +1673,6 @@ def get_batch_status(job_id: str):
         return {"error": "not found"}
     return job
 
-
-from fastapi.responses import FileResponse
 
 @app.get("/batch/{job_id}/download")
 def download_batch(job_id: str):
