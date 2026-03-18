@@ -2,7 +2,7 @@
 
 A containerized full-stack application for geospatial/energy infrastructure analysis and machine learning inference, built with a **FastAPI backend**, **React/Vite frontend**, and **PostgreSQL**.
 
-> **Quick start:** Clone the repo, download the ML model files (link to be added), place them in `backend/app/ml_models/`, then run `docker compose up --build -d`.
+> **Quick start:** Clone the repo, download the ML model files (link to be added), place them in `backend/app/ml_models/` (create directory first), then run `docker compose up --build -d`.
 
 ---
 
