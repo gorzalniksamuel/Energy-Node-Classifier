@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
-// @ts-ignore
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+
 import readXlsxFile from 'read-excel-file';
 import {
     Map,
@@ -105,9 +105,33 @@ interface BatchRow {
     lat: number;
     lon: number;
     buffer: number;
-    status: 'pending' | 'processing' | 'done' | 'error';
+    status: 'done' | 'processing' | 'error';
     result?: string;
 }
+
+interface BatchJobState {
+    jobId: string | null;
+    fileName: string | null;
+    rows: BatchRow[];
+    loading: boolean;
+    processed: boolean;
+    progress: number;
+    total: number;
+    error: string | null;
+}
+
+const BATCH_STATE_KEY = 'energy-node-batch-job-v1';
+
+const EMPTY_BATCH_JOB: BatchJobState = {
+    jobId: null,
+    fileName: null,
+    rows: [],
+    loading: false,
+    processed: false,
+    progress: 0,
+    total: 0,
+    error: null,
+};
 
 // Map methods to required keys (if any)
 const methodRequirements: Partial<Record<ResearchMethod, keyof ApiKeys>> = {
@@ -288,8 +312,10 @@ const Sidebar = ({
 
                     {isKeysExpanded && (
                         <div className="space-y-4 mt-2 animate-in fade-in slide-in-from-top-1 duration-200">
-                            {(Object.keys(keys) as Array<keyof ApiKeys>).map((k) => (
-                                <div key={k} className="space-y-1">
+                            {(Object.keys(keys) as Array<keyof ApiKeys>)
+                                .filter((k) => k !== 'google_maps')
+                                .map((k) => (
+                                    <div key={k} className="space-y-1">
                                     <label className={`text-xs font-medium capitalize ${textSecondary}`}>{k === 'aws'
                                         ? 'AWS DB'
                                         : k === 'google_maps'
@@ -391,11 +417,9 @@ const Sidebar = ({
                                     {/* HINT for missing keys */}
                                     {methods[m.id] && missingKey && (
                                         <div className="ml-9 text-xs text-red-500 flex items-center gap-1 mb-1">
-                                            <AlertCircle size={10} />
+                                            <AlertCircle size={10}/>
                                             <span>
-    Requires valid {reqKey === "gemini"
-                                                ? "Gemini + Google Maps"
-                                                : reqKey} key
+  Requires valid {reqKey === "gemini" ? "Gemini" : reqKey} key
 </span>
                                         </div>
                                     )}
@@ -548,7 +572,7 @@ const SingleMode = ({
     }`;
 
     // Buffer Options
-    const bufferOptions = [1., 1.2, 1.4, 1.6, 0.3];
+    const bufferOptions = [0.8, 1., 1.2, 1.4, 1.5, 1.6, 0.3];
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
@@ -1416,33 +1440,23 @@ const SingleMode = ({
     );
 };
 
-// 3. Batch Mode View
+// Batch Mode View
 const BatchMode = ({
                        isDarkMode,
                        isConfigConfirmed,
-                       keys,
-                       methods,
-                       clfModel,
-                       detModel,
-                       fusionWeights
+                       batchJob,
+                       setBatchJob,
+                       onStartBatch,
+                       onClearBatchJob
                    }: {
     isDarkMode: boolean;
     isConfigConfirmed: boolean;
-    keys: ApiKeys;
-    methods: Record<ResearchMethod, boolean>;
-    clfModel: string;
-    detModel: string;
-    fusionWeights: {
-        image: number;
-        osm: number;
-        database: number;
-        agent: number;
-    };
+    batchJob: BatchJobState;
+    setBatchJob: React.Dispatch<React.SetStateAction<BatchJobState>>;
+    onStartBatch: (file: File) => Promise<void>;
+    onClearBatchJob: () => void;
 }) => {
     const [file, setFile] = useState<File | null>(null);
-    const [rows, setRows] = useState<BatchRow[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [processed, setProcessed] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const cardBg = isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200';
@@ -1451,6 +1465,7 @@ const BatchMode = ({
     const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
         const uploadedFile = e.target.files?.[0];
         if (!uploadedFile) return;
+
         setFile(uploadedFile);
 
         if (uploadedFile.name.endsWith('.csv')) {
@@ -1459,34 +1474,66 @@ const BatchMode = ({
                 const text = event.target?.result as string;
                 const lines = text.split('\n');
                 const parsed: BatchRow[] = [];
+
                 lines.forEach((line, idx) => {
                     if (!line.trim()) return;
+
+                    // skip header row if present
+                    if (idx === 0 && line.toLowerCase().includes('latitude')) return;
+
                     const [lat, lon, buff] = line.split(',').map(s => parseFloat(s.trim()));
                     if (!isNaN(lat) && !isNaN(lon) && !isNaN(buff)) {
                         if (buff <= 50) {
-                            parsed.push({ lat, lon, buffer: buff, status: 'pending' });
+                            parsed.push({ lat, lon, buffer: buff, status: 'done' });
                         }
                     }
                 });
-                setRows(parsed);
+
+                setBatchJob(prev => ({
+                    ...prev,
+                    rows: parsed,
+                    fileName: uploadedFile.name,
+                    progress: 0,
+                    total: parsed.length,
+                    error: null,
+                    processed: false,
+                    loading: false,
+                    jobId: null,
+                }));
             };
             reader.readAsText(uploadedFile);
         } else if (uploadedFile.name.match(/\.xlsx?$/)) {
-            readXlsxFile(uploadedFile).then((rows: any[]) => {
+            readXlsxFile(uploadedFile).then((sheetRows: any[]) => {
                 const parsed: BatchRow[] = [];
-                rows.forEach((row) => {
+
+                sheetRows.forEach((row, idx) => {
+                    if (idx === 0 && String(row[0] ?? '').toLowerCase().includes('latitude')) {
+                        return;
+                    }
+
                     if (row.length >= 3) {
                         const lat = parseFloat(String(row[0]));
                         const lon = parseFloat(String(row[1]));
                         const buff = parseFloat(String(row[2]));
                         if (!isNaN(lat) && !isNaN(lon) && !isNaN(buff)) {
                             if (buff <= 50) {
-                                parsed.push({ lat, lon, buffer: buff, status: 'pending' });
+                                parsed.push({ lat, lon, buffer: buff, status: 'done' });
                             }
                         }
                     }
                 });
-                setRows(parsed);
+
+                setBatchJob(prev => ({
+                    ...prev,
+                    rows: parsed,
+                    fileName: uploadedFile.name,
+                    progress: 0,
+                    total: parsed.length,
+                    error: null,
+                    processed: false,
+                    loading: false,
+                    jobId: null,
+                }));
             }).catch((err: any) => {
                 console.error("Error reading excel file:", err);
                 alert("Error reading Excel file.");
@@ -1494,96 +1541,21 @@ const BatchMode = ({
         }
     };
 
-    const pollJob = (id: string) => {
-        const interval = setInterval(async () => {
-            try {
-                const res = await fetch(`/api/batch/${id}`);
-                const data = await res.json();
-
-                if (data.status === "finished") {
-                    clearInterval(interval);
-                    setLoading(false);
-                    setProcessed(true);
-                }
-
-                if (data.status === "error") {
-                    clearInterval(interval);
-                    setLoading(false);
-                    alert("Batch failed");
-                }
-
-            } catch (err) {
-                console.error(err);
-                clearInterval(interval);
-                setLoading(false);
-            }
-        }, 2000);
-    };
-
-    const [jobId, setJobId] = useState<string | null>(null);
-
-    const startBatch = async () => {
+    const handleRunBatch = async () => {
         if (!file) return;
-
-        setLoading(true);
-        setProcessed(false);
-
-        try {
-            const formData = new FormData();
-            formData.append("file", file);
-
-            // API Keys
-            formData.append("aws_api_key", keys.aws);
-            formData.append("mapbox_api_key", keys.mapbox);
-            formData.append("gemini_api_key", keys.gemini);
-            formData.append("google_maps_api_key", keys.google_maps);
-
-            // Feature flags
-            formData.append("run_osm", String(methods.osm));
-            formData.append("run_database", String(methods.database));
-            formData.append("run_classification", String(methods.classification));
-            formData.append("run_object_detection", String(methods.object_detection));
-            formData.append("run_agent", String(methods.agent));
-            formData.append("run_heat_radiation", String(methods.heat));
-
-            // Model selection
-            formData.append("classification_model", clfModel);
-            formData.append("detection_model", detModel);
-
-            // Fusion weights (must be stringified)
-            formData.append("fusion_weights", JSON.stringify(fusionWeights));
-
-            const response = await fetch("api/batch", {
-                method: "POST",
-                body: formData
-            });
-
-            if (!response.ok) throw new Error("Failed to start batch");
-
-            const data = await response.json();
-            const id = data.job_id;
-
-            setJobId(id);
-
-            pollJob(id);
-
-        } catch (err) {
-            console.error(err);
-            alert("Failed to start batch process");
-            setLoading(false);
-        }
+        await onStartBatch(file);
     };
 
     const downloadCSV = () => {
-        if (!jobId) return;
-        window.open(`/api/batch/${jobId}/download`, "_blank");
+        if (!batchJob.jobId) return;
+        window.open(`/api/batch/${batchJob.jobId}/download`, "_blank");
     };
 
     return (
         <div className="space-y-6">
             <div className={`p-6 rounded-lg shadow-sm border ${cardBg}`}>
                 <h2 className={`text-lg font-semibold mb-4 ${textPrimary}`}>Batch Prediction</h2>
-                {/* =============================== Input File Requirements Panel =============================== */}
+
                 <div className={`mb-6 p-4 rounded border text-sm ${
                     isDarkMode
                         ? 'bg-slate-800 border-slate-700 text-slate-300'
@@ -1593,7 +1565,7 @@ const BatchMode = ({
 
                     <ul className="list-disc pl-5 space-y-1">
                         <li>Supported formats: <b>.csv</b> or <b>.xlsx</b></li>
-                        <li>First row must contain headers</li>
+                        <li>First row should contain headers</li>
                         <li>Required columns (case-sensitive):</li>
                     </ul>
 
@@ -1615,19 +1587,27 @@ const BatchMode = ({
                     <div className="text-center py-20 text-slate-500 flex flex-col items-center">
                         <Lock className="mb-4 text-slate-400" size={48} />
                         <p className="font-medium">Configuration Locked</p>
-                        <p className="text-sm mt-1">Please confirm your API settings and research methods in the sidebar to enable batch processing.</p>
+                        <p className="text-sm mt-1">
+                            Please confirm your API settings and research methods in the sidebar to enable batch processing.
+                        </p>
                     </div>
                 ) : (
                     <>
-                        {!loading && !processed && (
+                        {!batchJob.loading && !batchJob.processed && (
                             <div className="space-y-4">
                                 <div
                                     onClick={() => fileInputRef.current?.click()}
-                                    className={`border-2 border-dashed rounded-lg p-10 flex flex-col items-center justify-center cursor-pointer transition-colors ${isDarkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-300 hover:bg-slate-50'}`}
+                                    className={`border-2 border-dashed rounded-lg p-10 flex flex-col items-center justify-center cursor-pointer transition-colors ${
+                                        isDarkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-300 hover:bg-slate-50'
+                                    }`}
                                 >
                                     <Upload className="text-slate-400 mb-2" size={32} />
-                                    <span className={`font-medium ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>Click to upload CSV or Excel</span>
-                                    <span className="text-slate-400 text-sm mt-1">Format: lat, lon, buffer (Max 50km buffer)</span>
+                                    <span className={`font-medium ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                                        Click to upload CSV or Excel
+                                    </span>
+                                    <span className="text-slate-400 text-sm mt-1">
+                                        Format: lat, lon, buffer (Max 50km buffer)
+                                    </span>
                                     <input
                                         type="file"
                                         ref={fileInputRef}
@@ -1637,16 +1617,16 @@ const BatchMode = ({
                                     />
                                 </div>
 
-                                {file && (
+                                {batchJob.fileName && (
                                     <div className={`flex items-center justify-between p-3 rounded ${isDarkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
                                         <div className="flex items-center gap-2">
                                             <FileText size={18} className="text-blue-500" />
-                                            <span className={`text-sm font-medium ${textPrimary}`}>{file.name}</span>
-                                            <span className="text-xs text-slate-500">({rows.length} valid rows)</span>
+                                            <span className={`text-sm font-medium ${textPrimary}`}>{batchJob.fileName}</span>
+                                            <span className="text-xs text-slate-500">({batchJob.rows.length} valid rows)</span>
                                         </div>
                                         <button
-                                            onClick={startBatch}
-                                            disabled={rows.length === 0}
+                                            onClick={handleRunBatch}
+                                            disabled={batchJob.rows.length === 0 || batchJob.loading}
                                             className="bg-blue-600 text-white px-4 py-1.5 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
                                         >
                                             Run Batch
@@ -1656,15 +1636,27 @@ const BatchMode = ({
                             </div>
                         )}
 
-                        {loading && (
+                        {batchJob.loading && (
                             <div className="flex flex-col items-center justify-center py-20 text-center">
                                 <div className="w-16 h-16 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mb-4"></div>
                                 <h3 className={`text-lg font-medium ${textPrimary}`}>Processing Batch Data...</h3>
-                                <p className="text-slate-500 text-sm">Running background python tasks...</p>
+                                <p className="text-slate-500 text-sm">
+                                    {batchJob.total > 0
+                                        ? `Progress: ${batchJob.progress}/${batchJob.total}`
+                                        : 'Running background python tasks...'}
+                                </p>
                             </div>
                         )}
 
-                        {processed && (
+                        {batchJob.error && !batchJob.loading && (
+                            <div className={`mt-4 p-3 rounded text-sm ${
+                                isDarkMode ? 'bg-red-900/20 text-red-200 border border-red-800' : 'bg-red-50 text-red-700 border border-red-200'
+                            }`}>
+                                {batchJob.error}
+                            </div>
+                        )}
+
+                        {batchJob.processed && (
                             <div>
                                 <div className="flex justify-between items-center mb-4">
                                     <div className="flex items-center gap-2 text-green-600">
@@ -1673,12 +1665,15 @@ const BatchMode = ({
                                     </div>
                                     <button
                                         onClick={downloadCSV}
-                                        className={`flex items-center gap-2 px-4 py-2 rounded text-sm transition-colors ${isDarkMode ? 'bg-slate-700 text-white hover:bg-slate-600' : 'bg-slate-800 text-white hover:bg-slate-900'}`}
+                                        className={`flex items-center gap-2 px-4 py-2 rounded text-sm transition-colors ${
+                                            isDarkMode ? 'bg-slate-700 text-white hover:bg-slate-600' : 'bg-slate-800 text-white hover:bg-slate-900'
+                                        }`}
                                     >
                                         <Download size={16} />
                                         Download CSV
                                     </button>
                                 </div>
+
                                 <div className={`max-h-[400px] overflow-auto border rounded ${isDarkMode ? 'border-slate-700' : 'border-slate-200'}`}>
                                     <table className={`w-full text-sm text-left ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
                                         <thead className={`sticky top-0 ${isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-50 text-slate-500'}`}>
@@ -1691,13 +1686,15 @@ const BatchMode = ({
                                         </tr>
                                         </thead>
                                         <tbody>
-                                        {rows.map((r, i) => (
+                                        {batchJob.rows.map((r, i) => (
                                             <tr key={i} className={`border-b ${isDarkMode ? 'border-slate-800 hover:bg-slate-800/50' : 'border-slate-100 hover:bg-slate-50'}`}>
                                                 <td className="px-4 py-2">{r.lat}</td>
                                                 <td className="px-4 py-2">{r.lon}</td>
                                                 <td className="px-4 py-2">{r.buffer}</td>
                                                 <td className="px-4 py-2">
-                                                    <span className="bg-green-100 text-green-800 text-xs px-2 py-0.5 rounded-full uppercase">{r.status}</span>
+                                                        <span className="bg-green-100 text-green-800 text-xs px-2 py-0.5 rounded-full uppercase">
+                                                            {r.status}
+                                                        </span>
                                                 </td>
                                                 <td className="px-4 py-2">{r.result}</td>
                                             </tr>
@@ -1705,8 +1702,12 @@ const BatchMode = ({
                                         </tbody>
                                     </table>
                                 </div>
+
                                 <button
-                                    onClick={() => { setProcessed(false); setFile(null); setRows([]); }}
+                                    onClick={() => {
+                                        setFile(null);
+                                        onClearBatchJob();
+                                    }}
                                     className="mt-4 text-sm text-blue-600 hover:underline"
                                 >
                                     Start New Batch
@@ -1720,14 +1721,15 @@ const BatchMode = ({
     );
 };
 
-// 4. Main App Layout
+// Main App Layout
 const App = () => {
     const [keys, setKeys] = useState<ApiKeys>({
         mapbox: '',
         aws: '',
         gemini: '',
         google_maps: ''
-    });    const [isDarkMode, setIsDarkMode] = useState(false);
+    });
+    const [isDarkMode, setIsDarkMode] = useState(false);
 
     const [validationStatus, setValidationStatus] = useState<Record<string, 'idle' | 'checking' | 'valid' | 'invalid'>>({});
     const [isConfigConfirmed, setIsConfigConfirmed] = useState(false);
@@ -1741,7 +1743,6 @@ const App = () => {
         agent: false
     });
 
-    // initial parameters for fusion
     const [fusionWeights, setFusionWeights] = useState({
         image: 0.4,
         osm: 0.25,
@@ -1749,13 +1750,159 @@ const App = () => {
         agent: 0.10
     });
 
-    // --- New State for Model Selection ---
     const [clfModel, setClfModel] = useState("convnext_large");
-    const [detModel, setDetModel] = useState("yolo11");
+    const [detModel, setDetModel] = useState("yolo26");
 
     const [mode, setMode] = useState<AppMode>('single');
     const [singleLoading, setSingleLoading] = useState(false);
     const [singleResult, setSingleResult] = useState<SinglePredictionResult | null>(null);
+
+    const [batchJob, setBatchJob] = useState<BatchJobState>(() => {
+        if (typeof window === 'undefined') return EMPTY_BATCH_JOB;
+
+        try {
+            const raw = localStorage.getItem(BATCH_STATE_KEY);
+            if (!raw) return EMPTY_BATCH_JOB;
+            return { ...EMPTY_BATCH_JOB, ...JSON.parse(raw) };
+        } catch {
+            return EMPTY_BATCH_JOB;
+        }
+    });
+
+    const batchPollRef = useRef<number | null>(null);
+
+    const stopBatchPolling = useCallback(() => {
+        if (batchPollRef.current !== null) {
+            window.clearInterval(batchPollRef.current);
+            batchPollRef.current = null;
+        }
+    }, []);
+
+    const clearBatchJob = useCallback(() => {
+        stopBatchPolling();
+        setBatchJob(EMPTY_BATCH_JOB);
+        if (typeof window !== 'undefined') {
+            localStorage.removeItem(BATCH_STATE_KEY);
+        }
+    }, [stopBatchPolling]);
+
+    useEffect(() => {
+        if (typeof window !== 'undefined') {
+            localStorage.setItem(BATCH_STATE_KEY, JSON.stringify(batchJob));
+        }
+    }, [batchJob]);
+
+    const pollBatchJob = useCallback((id: string) => {
+        stopBatchPolling();
+
+        const tick = async () => {
+            try {
+                const res = await fetch(`/api/batch/${id}`);
+                const data = await res.json();
+
+                if (data?.error === 'not found') {
+                    setBatchJob(prev => ({
+                        ...prev,
+                        loading: false,
+                        error: 'Batch job not found on backend.',
+                    }));
+                    stopBatchPolling();
+                    return;
+                }
+
+                setBatchJob(prev => ({
+                    ...prev,
+                    jobId: id,
+                    loading: data.status === 'running',
+                    processed: data.status === 'finished',
+                    progress: typeof data.progress === 'number' ? data.progress : prev.progress,
+                    total: typeof data.total === 'number' ? data.total : prev.total,
+                    error: data.status === 'error' ? (data.error || 'Batch failed') : null,
+                }));
+
+                if (data.status === 'finished' || data.status === 'error') {
+                    stopBatchPolling();
+                }
+            } catch (err) {
+                console.error('Batch polling failed:', err);
+            }
+        };
+
+        tick();
+        batchPollRef.current = window.setInterval(tick, 2000);
+    }, [stopBatchPolling]);
+
+    useEffect(() => {
+        return () => stopBatchPolling();
+    }, [stopBatchPolling]);
+
+    useEffect(() => {
+        if (batchJob.jobId && !batchJob.processed && !batchJob.error && batchPollRef.current === null) {
+            pollBatchJob(batchJob.jobId);
+        }
+    }, [batchJob.jobId, batchJob.processed, batchJob.error, pollBatchJob]);
+
+    const startBatch = async (file: File) => {
+        setBatchJob(prev => ({
+            ...prev,
+            loading: true,
+            processed: false,
+            progress: 0,
+            error: null,
+            total: prev.rows.length,
+        }));
+
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+
+            formData.append("aws_api_key", keys.aws);
+            formData.append("mapbox_api_key", keys.mapbox);
+            formData.append("gemini_api_key", keys.gemini);
+            formData.append("google_maps_api_key", keys.google_maps);
+
+            formData.append("run_osm", String(methods.osm));
+            formData.append("run_database", String(methods.database));
+            formData.append("run_classification", String(methods.classification));
+            formData.append("run_object_detection", String(methods.object_detection));
+            formData.append("run_agent", String(methods.agent));
+            formData.append("run_heat_radiation", String(methods.heat));
+
+            formData.append("classification_model", clfModel);
+            formData.append("detection_model", detModel);
+            formData.append("fusion_weights", JSON.stringify(fusionWeights));
+
+            const response = await fetch("/api/batch", {
+                method: "POST",
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to start batch: ${response.status}`);
+            }
+
+            const data = await response.json();
+            const id = data.job_id;
+
+            setBatchJob(prev => ({
+                ...prev,
+                jobId: id,
+                loading: true,
+                processed: false,
+                progress: 0,
+                error: null,
+            }));
+
+            pollBatchJob(id);
+        } catch (err) {
+            console.error(err);
+            setBatchJob(prev => ({
+                ...prev,
+                loading: false,
+                error: 'Failed to start batch process.',
+            }));
+        }
+    };
 
     const toggleMethod = (m: ResearchMethod) => {
         setMethods(prev => ({ ...prev, [m]: !prev[m] }));
@@ -1790,24 +1937,12 @@ const App = () => {
                     run_classification: methods.classification,
                     run_object_detection: methods.object_detection,
                     run_agent: methods.agent,
-
                     run_heat_radiation: methods.heat,
 
                     classification_model: clfModel,
                     detection_model: detModel,
                     fusion_weights: fusionWeights,
-
-                    // (Optional) if you want to override backend defaults:
-                    // heat_start_date: "2024-06-01",
-                    // heat_end_date: "2024-09-30",
-                    // heat_max_cloud: 75.0,
-                    // heat_max_scenes: 20,
-                    // heat_aoi_m: 1000,
-                    // heat_ring_inner_m: 2000,
-                    // heat_ring_outer_m: 4500,
-                    // heat_hotspot_offset_c: 1.0,
                 }),
-
             });
 
             if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
@@ -1844,8 +1979,6 @@ const App = () => {
                 heat_radiation_result: data.heat_radiation_result,
                 fusion_result: data.fusion_result,
             });
-
-
         } catch (error) {
             console.error('Prediction Error:', error);
             setSingleResult({
@@ -1877,7 +2010,6 @@ const App = () => {
                 setClfModel={setClfModel}
                 detModel={detModel}
                 setDetModel={setDetModel}
-
                 fusionWeights={fusionWeights}
                 setFusionWeights={setFusionWeights}
             />
@@ -1886,7 +2018,9 @@ const App = () => {
                 <div className="flex justify-between items-center mb-8">
                     <div>
                         <h2 className={`text-2xl font-bold ${isDarkMode ? 'text-slate-100' : 'text-slate-800'}`}>Dashboard</h2>
-                        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Configure analysis parameters and review predictions.</p>
+                        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                            Configure analysis parameters and review predictions.
+                        </p>
                     </div>
 
                     <div className={`p-1 rounded-lg flex ${isDarkMode ? 'bg-slate-800' : 'bg-slate-200'}`}>
@@ -1913,6 +2047,24 @@ const App = () => {
                     </div>
                 </div>
 
+                {batchJob.loading && (
+                    <div className={`mb-6 p-3 rounded border text-sm flex items-center justify-between ${
+                        isDarkMode
+                            ? 'bg-blue-900/20 border-blue-800 text-blue-200'
+                            : 'bg-blue-50 border-blue-200 text-blue-800'
+                    }`}>
+                        <span>
+                            Batch job running in background: {batchJob.progress}/{batchJob.total}
+                        </span>
+                        <button
+                            onClick={() => setMode('batch')}
+                            className="underline underline-offset-2"
+                        >
+                            Open batch view
+                        </button>
+                    </div>
+                )}
+
                 {mode === 'single' ? (
                     <SingleMode
                         methods={methods}
@@ -1926,15 +2078,16 @@ const App = () => {
                     <BatchMode
                         isDarkMode={isDarkMode}
                         isConfigConfirmed={isConfigConfirmed}
-                        keys={keys}
-                        methods={methods}
-                        clfModel={clfModel}
-                        detModel={detModel}
-                        fusionWeights={fusionWeights}
-                    />                )}
+                        batchJob={batchJob}
+                        setBatchJob={setBatchJob}
+                        onStartBatch={startBatch}
+                        onClearBatchJob={clearBatchJob}
+                    />
+                )}
             </main>
         </div>
     );
 };
+
 
 export default App;
