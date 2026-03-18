@@ -12,3 +12,5 @@ for i in range(torch.cuda.device_count()):
     print(f"device {i}:", torch.cuda.get_device_name(i))
     x = torch.randn(1, device=f"cuda:{i}")
     print("allocated OK on", f"cuda:{i}")
+
+
