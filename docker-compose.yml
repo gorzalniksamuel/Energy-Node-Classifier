@@ -6,7 +6,7 @@ services:
     container_name: postgres_db
     restart: always
     environment:
-      - POSTGRES_USER=adminuser
+      - POSTGRES_USER=adminuser # placeholders for local database integration
       - POSTGRES_PASSWORD=ultrasafepassword
       - POSTGRES_DB=energygridclassifier
     ports:
@@ -21,7 +21,7 @@ services:
       - "8001:8000"
     volumes:
       - ./backend/app:/app
-    depends_on:
+    depends_on: # placeholders for local database integration
       - db
     environment:
       - DATABASE_URL=postgresql://adminuser:ultrasafepassword@db:5432/energygridclassifier
